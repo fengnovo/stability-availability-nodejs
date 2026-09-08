@@ -313,3 +313,125 @@ express-session 检测 req.session 是否被修改
 所以可以理解为：req.session 就是 Redis 中那条 session 数据在内存中的代理对象，读是从 Redis 来，写会自动同步回 Redis。
 
 ![运维整体流程图](./mermaid.png)
+
+
+```mermaid
+flowchart TB
+    User["用户 / UI / API / SDKs"]
+
+    subgraph vpc["VPC / 私有网络"]
+        Web["Web 服务<br/>(langfuse/langfuse)"]
+        Worker["异步 Worker<br/>(langfuse/worker)"]
+
+        Postgres[("PostgreSQL<br/>(事务数据)")]
+        Redis[("Redis<br/>(缓存与队列)")]
+        Clickhouse[("ClickHouse<br/>(观测数据)")]
+        S3[("S3 / 对象存储<br/>(原始事件/附件)")]
+    end
+
+    LLM["LLM API / 网关<br/>(可选)"]
+
+    User -->|"公开访问"| Web
+
+    Web -->|"读写"| Postgres
+    Web -->|"读写"| Redis
+    Web -->|"查询"| Clickhouse
+    Web -->|"读写"| S3
+    Web -.->|"Playground 功能"| LLM
+
+    Redis -->|"任务队列"| Worker
+    Worker -->|"写入"| Clickhouse
+    Worker -->|"读写"| Postgres
+    Worker -->|"读写"| S3
+    Worker -.->|"模型评估"| LLM
+```
+
+```mermaid
+flowchart TB
+    User["👤 海量用户"]
+
+    subgraph Access_Layer [第一层：接入与安全层]
+        DNS["DNS 智能解析"]
+        CDN["CDN 静态加速"]
+        WAF["WAF 防火墙"]
+    end
+
+    subgraph Gateway_Layer [第二层：流量网关层]
+        SLB["四层负载均衡（SLB/LVS）<br/>（防DDoS，健康检查）"]
+        Nginx["七层反向代理（Nginx/Ingress）<br/>（限流、黑白名单、路由转发）"]
+    end
+
+    subgraph App_Layer [第三层：应用服务层 - 核心抗压区]
+        direction LR
+        Pod1["Pod 实例 A<br/>（无状态）"]
+        Pod2["Pod 实例 B<br/>（无状态）"]
+        Pod3["Pod 实例 C<br/>（无状态）"]
+        HPA["⚙️ 自动伸缩（HPA）<br/>（基于CPU/QPS）"]
+        Pod1 -.-> HPA
+        Pod2 -.-> HPA
+        Pod3 -.-> HPA
+    end
+
+    subgraph Middleware_Layer [第四层：中间件与数据层]
+        Cache[("Redis 集群<br/>（缓存会话/热点数据）")]
+        MQ[("消息队列（Kafka/RabbitMQ）<br/>（异步削峰填谷）")]
+        DB[("主从数据库（MySQL/PostgreSQL）<br/>主库（写） + 只读从库（读）")]
+    end
+
+    User --> DNS --> CDN --> WAF --> SLB --> Nginx
+    Nginx -->|负载均衡| Pod1 & Pod2 & Pod3
+    
+    Pod1 & Pod2 & Pod3 -->|先读缓存| Cache
+    Pod1 & Pod2 & Pod3 -->|异步解耦| MQ
+    Pod1 & Pod2 & Pod3 -->|读写分离| DB
+    
+    DB -->|主从同步| DB
+```
+
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant LB as 网关/负载均衡
+    participant App as 应用Pod
+    participant Cache as Redis缓存
+    participant MQ as 消息队列
+    participant DB as 数据库主从
+
+    rect rgb(200, 230, 255)
+        Note over User,DB: 1. 正常流量处理路径（低延迟）
+        User->>LB: 发起请求
+        LB->>App: 轮询转发
+        App->>Cache: 查询缓存(80%命中)
+        Cache-->>App: 返回热点数据
+        App-->>User: 毫秒级响应
+    end
+
+    rect rgb(255, 220, 220)
+        Note over User,DB: 2. 突发流量/高压处理路径（削峰填谷）
+        App->>App: 检测到CPU > 70% 或 QPS激增
+        App->>MQ: 将非实时逻辑(如发邮件/写日志)投递队列
+        MQ-->>App: 异步确认，释放计算资源
+        App->>DB: 写入核心业务(分库分表)
+    end
+
+    rect rgb(240, 230, 140)
+        Note over App,HPA: 3. 自动扩容机制（HPA）
+        App->>HPA: 上报指标(CPU/QPS)
+        HPA->>K8s: 触发扩容( replicas: 3 -> 10 )
+        K8s->>App: 启动新Pod(预热后接入LB)
+    end
+```
+
+高稳定性与高可用的 4 个“压舱石”, 以下具体策略：  
+无状态应用（Stateless）：这是最重要的前提。所有Session（会话）存到Redis，文件存到OSS（对象存储）。应用本身不存任何持久化数据，这意味着K8s可以像捏橡皮泥一样随意捏合Pod数量，重启或崩溃都不会丢失状态。
+
+数据库“读写分离 + 分库分表”：这是系统瓶颈所在。部署时必须配置1个主库（写） + N个只读从库（读）。网关层配置拦截器，读请求自动走从库，写请求走主库。流量再大，主库也不会因为复杂的查询SQL被拖垮。
+
+缓存预热 + 布隆过滤器：Redis必须开启持久化（AOF/RDB）。为了防止缓存瞬间失效导致数据库被打死（缓存雪崩），必须给热点Key设置不同的随机过期时间，并利用布隆过滤器拦截掉不存在的Key查询（缓存穿透）。
+
+熔断与降级：在网关层（Nginx/Spring Cloud Gateway）配置超时和重试。当下游数据库响应变慢时，直接返回兜底数据（比如“活动太火爆，请稍后再试”），而不是让线程池全部阻塞导致应用雪崩。  
+
+核心原则: 应用容器化跑在K8s（无状态），数据库/缓存买云厂商托管服务（有状态）。
+
+普通应用多了一层网关层（Nginx/Ingress），负责限流和路由分发，而Langfuse通常直接暴露Web端口。
+普通应用极依赖Redis缓存来扛QPS，而Langfuse更依赖ClickHouse列式存储来扛海量写入。
