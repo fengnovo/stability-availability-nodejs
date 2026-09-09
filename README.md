@@ -20,7 +20,7 @@
 
 ### 目录结构
 ```
-node-ha-demo/
+stability-availability-nodejs/
 ├── .env
 ├── .env.example
 ├── package.json
@@ -135,7 +135,7 @@ docker-compose up -d
 npm install
 
 # 3. 创建数据库表（在主库和从库分别执行，保证读写分离测试）
-docker exec -i node-ha-demo-mysql_master-1 mysql -uroot -p123456 test << 'EOF'
+docker exec -i stability-availability-nodejs-mysql_master-1 mysql -uroot -p123456 test << 'EOF'
 CREATE TABLE IF NOT EXISTS products (
   id INT PRIMARY KEY,
   name VARCHAR(100),
@@ -145,7 +145,7 @@ CREATE TABLE IF NOT EXISTS products (
 INSERT INTO products (id, name, price, stock) VALUES (1, 'Product A', 19.99, 100), (2, 'Product B', 29.99, 50);
 EOF
 
-docker exec -i node-ha-demo-mysql_slave-1 mysql -uroot -p123456 test << 'EOF'
+docker exec -i stability-availability-nodejs-mysql_slave-1 mysql -uroot -p123456 test << 'EOF'
 CREATE TABLE IF NOT EXISTS products (
   id INT PRIMARY KEY,
   name VARCHAR(100),

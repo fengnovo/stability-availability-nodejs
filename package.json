@@ -1,5 +1,5 @@
 {
-  "name": "node-ha-demo",
+  "name": "stability-availability-nodejs",
   "version": "1.0.0",
   "description": "High availability Node.js demo with 4 pillars",
   "main": "src/server.js",
